@@ -5,6 +5,8 @@ import numpy as np
 import random
 import inspect
 import pdb
+import matplotlib.pyplot as plt
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -27,14 +29,15 @@ def generate_data(phase, amp, num_points):
     func = np.vectorize(sinfunc)
     xs = np.random.uniform(-5.0, 5.0, num_points)
     ys = func(xs)
-    xs = np.expand_dims(xs, axis=1)
-    ys = np.expand_dims(ys, axis=1)
-    return torch.Tensor(xs), torch.Tensor(ys)
+    xs = torch.Tensor(np.expand_dims(xs, axis=1))
+    ys = torch.Tensor(np.expand_dims(ys, axis=1))
+    return Variable(xs).cuda(), Variable(ys).cuda()
 
 def evaluate(net, phase, amp, weights=None, num_points=5):
     inputs, targets = generate_data(phase, amp, num_points)
     outputs = net.net_forward(inputs, weights)
-    loss = nn.MSELoss(outputs, targets).sum()
+    loss_fn = nn.MSELoss()
+    loss = loss_fn(outputs, targets).sum()
     return loss.data[0]
 
 class SinusoidNet(nn.Module):
@@ -58,7 +61,7 @@ class SinusoidNet(nn.Module):
 
     def net_forward(self, x, weights=None):
         # for use when inherited by inner loop network
-        self.forward(x, weights)
+        return self.forward(x, weights)
 
     def copy_weights(self, net):
         ''' Set this module's weights to be the same as those of 'net' '''
@@ -88,6 +91,9 @@ class InnerLoop(SinusoidNet):
 
         # for loss normalization 
         self.meta_batch_size = meta_batch_size
+
+        # Loss Function (MSE loss)
+        self.loss_fn = nn.MSELoss()
     
 
     def net_forward(self, x, weights=None):
@@ -95,11 +101,9 @@ class InnerLoop(SinusoidNet):
 
     def forward_pass(self, in_, target, weights=None):
         ''' Run data through net, return loss and output '''
-        input_var = torch.autograd.Variable(in_).cuda(async=True)
-        target_var = torch.autograd.Variable(target).cuda(async=True)
         # Run the batch through the net, compute loss
-        out = self.net_forward(input_var, weights)
-        loss = nn.MSELoss(out, target_var)
+        out = self.net_forward(in_, weights)
+        loss = self.loss_fn(out, target)
         return loss, out
     
     def forward(self, phase, amp):
@@ -149,16 +153,18 @@ class MetaLearner(object):
         
         self.net = SinusoidNet()
         self.net.cuda()
-        self.fast_net = InnerLoop(num_classes, self.num_inner_updates, self.inner_step_size, self.inner_batch_size, self.meta_batch_size)
+        self.fast_net = InnerLoop(self.num_inner_updates, self.inner_step_size, self.inner_batch_size, self.meta_batch_size)
         self.fast_net.cuda()
         self.opt = Adam(self.net.parameters(), lr=meta_step_size)
+        self.loss_fn = nn.MSELoss()
             
     def meta_update(self, ls):
         print("\n Meta update \n")
         phase, amp = random_sample()
         in_, target = generate_data(phase, amp, self.inner_batch_size)
         # We use a dummy forward / backward pass to get the correct grads into self.net
-        loss, out = forward_pass(self.net, in_, target)
+        out = self.net.net_forward(in_)
+        loss = self.loss_fn(out, target)
         # Unpack the list of grad dicts
         gradients = {k: sum(d[k] for d in ls) for k in ls[0].keys()}
         # Register a hook on each parameter in the net that replaces the current dummy grad
@@ -180,23 +186,62 @@ class MetaLearner(object):
         for h in hooks:
             h.remove()
 
-    def test(self):
+    def test(self, viz=False, exp=None):
         test_net = SinusoidNet()
         mtr_loss = 0.0
         # Select ten tasks randomly from the test set to evaluate on
-        for _ in range(10):
+        for idx in range(10):
             # Make a test net with same parameters as our current net
             test_net.copy_weights(self.net)
             test_net.cuda()
             test_opt = SGD(test_net.parameters(), lr=self.inner_step_size)
             # Train on the train examples, using the same number of updates as in training
             phase, amp = random_sample()
-            for i in range(self.num_inner_updates):
+
+            # Make visualization
+            if viz:
+                x, y = generate_data(phase, amp, self.inner_batch_size)
+
+                # Do just one update first
                 in_, target = generate_data(phase, amp, self.inner_batch_size)
-                loss, _  = forward_pass(test_net, in_, target)
+                out = test_net.net_forward(in_)
+                loss = self.loss_fn(out, target)
                 test_opt.zero_grad()
                 loss.backward()
                 test_opt.step()
+
+                predict_1y = test_net.net_forward(x)
+
+                # Do 9 more
+                for i in range(9):
+                    in_, target = generate_data(phase, amp, self.inner_batch_size)
+                    out = test_net.net_forward(in_)
+                    loss = self.loss_fn(out, target)
+                    test_opt.zero_grad()
+                    loss.backward()
+                    test_opt.step()
+
+                predict_10y = test_net.net_forward(x)
+
+                xs = x.cpu().data.numpy()
+                predict1 = predict_1y.cpu().data.numpy()
+                predict10 = predict_10y.cpu().data.numpy()
+
+                xdomain = np.arange(-5.0, 5.0, 0.1)
+                sin = np.sin(xdomain + phase) * amp
+
+                plt.plot(xdomain, sin, 'r--', xs, predict1, 'bs', xs, predict10, 'g^')
+                plt.savefig('../output/{}/{}.png'.format(exp, idx))
+                plt.clf()  # Clear the plot
+            else:
+                for i in range(self.num_inner_updates):
+                    in_, target = generate_data(phase, amp, self.inner_batch_size)
+                    out = test_net.net_forward(in_)
+                    loss = self.loss_fn(out, target)
+                    test_opt.zero_grad()
+                    loss.backward()
+                    test_opt.step()
+
             # Evaluate the trained model on train and val examples
             tloss = evaluate(test_net, phase, amp)
             mtr_loss += tloss
@@ -222,6 +267,7 @@ class MetaLearner(object):
             self.meta_update(grads)
             
     def train(self, exp):
+        print("Training Metalearnerrrrr")
         tr_loss = []
         mtr_loss = []
         for it in range(self.num_updates):
@@ -232,14 +278,15 @@ class MetaLearner(object):
             grads = []
             tloss = 0.0
             for i in range(self.meta_batch_size):
+                phase, amp = random_sample()
                 self.fast_net.copy_weights(self.net)
-                trl, g = self.fast_net.forward(task)
+                trl, g = self.fast_net.forward(phase, amp)
                 grads.append(g)
                 tloss += trl
 
             # Perform the meta update
             print('Meta update', it)
-            self.meta_update(task, grads)
+            self.meta_update(grads)
 
             # Save a model snapshot every now and then
             if it % 500 == 0:
@@ -251,16 +298,24 @@ class MetaLearner(object):
             np.save('../output/{}/tr_loss.npy'.format(exp), np.array(tr_loss))
             np.save('../output/{}/meta_tr_loss.npy'.format(exp), np.array(mtr_loss))
 
+    def load_weights(self, weights_file):
+        print("Loading weights from ", weights_file)
+        weights = torch.load(weights_file)
+        self.net.load_state_dict(weights)
+        print("Successfully loaded")
+
 @click.command()
 @click.argument('exp')
-@click.option('--batch', type=int)
-@click.option('--m_batch', type=int)
-@click.option('--num_updates', type=int)
-@click.option('--num_inner_updates', type=int)
-@click.option('--lr',type=str)
-@click.option('--meta_lr', type=str)
+@click.option('--batch', type=int, default=10)
+@click.option('--m_batch', type=int, default=25)
+@click.option('--num_updates', type=int, default=70000)
+@click.option('--num_inner_updates', type=int, default=1)
+@click.option('--lr',type=str, default=0.001)
+@click.option('--meta_lr', type=str, default=0.001)
 @click.option('--gpu', default=0)
-def main(exp, dataset, batch, m_batch, num_updates, num_inner_updates, lr, meta_lr, gpu):
+@click.option('--test/--train', default=False)
+@click.option('--load_weights', type=str, default='')
+def main(exp, batch, m_batch, num_updates, num_inner_updates, lr, meta_lr, gpu, test, load_weights):
     random.seed(1337)
     np.random.seed(1337)
     # Print all the args for logging purposes
@@ -279,8 +334,11 @@ def main(exp, dataset, batch, m_batch, num_updates, num_inner_updates, lr, meta_
     print('Setting GPU to', str(gpu))
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
     learner = MetaLearner(m_batch, float(meta_lr), batch, float(lr), num_updates, num_inner_updates)
-    learner.train(exp)
+    if test:
+        learner.load_weights(load_weights)
+        learner.test(viz=True, exp=exp)
+    else:
+        learner.train(exp)
 
 if __name__ == '__main__':
     main()
-
